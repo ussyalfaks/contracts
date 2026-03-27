@@ -2,6 +2,8 @@
 #![allow(deprecated)]
 
 use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address,
+    Bytes, BytesN, Env, Map, String, Symbol, Vec,
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
     Address, Bytes, BytesN, Env, Map, String, Symbol, Vec,
 };
@@ -75,6 +77,22 @@ pub enum DataKey {
     Treasury,
     FeeToken,
     TotalPatients,
+    /// Nonce counter per patient for share-link token generation.
+    ShareNonce(Address),
+    /// Share link data keyed by token hash.
+    ShareLink(BytesN<32>),
+}
+
+/// --------------------
+/// Share Link
+/// --------------------
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShareLinkData {
+    pub patient: Address,
+    pub record_id: u64,
+    pub uses_remaining: u32,
+    pub expires_at: u64,
     RecordCounter(Address),
     Frozen,
 }
@@ -104,6 +122,7 @@ pub struct RegulatoryHold {
 #[repr(u32)]
 pub enum ContractError {
     InvalidCID = 1,
+    InvalidToken = 2,
     InvalidDID = 2,
     InvalidScore = 3,
     ContractFrozen = 2,
@@ -935,6 +954,139 @@ impl MedicalRegistry {
 
     pub fn get_last_snapshot_ledger(env: Env) -> Option<u32> {
         env.storage().instance().get(&DataKey::LastSnapshotLedger)
+    }
+
+    // =====================================================
+    //              PATIENT-CONTROLLED SHARE LINKS
+    // =====================================================
+
+    /// Create a time-limited, use-counted sharing token for a single record.
+    ///
+    /// Token = sha256(patient_bytes || record_id_be || nonce_be || expires_at_be)
+    ///
+    /// # Arguments
+    /// * `patient`    - The patient who owns the record (must auth).
+    /// * `record_id`  - 0-based index into the patient's medical records vec.
+    /// * `uses_remaining` - How many times the token may be used (must be > 0).
+    /// * `expires_at` - Unix timestamp after which the token is invalid.
+    pub fn create_share_link(
+        env: Env,
+        patient: Address,
+        record_id: u64,
+        uses_remaining: u32,
+        expires_at: u64,
+    ) -> Result<BytesN<32>, ContractError> {
+        patient.require_auth();
+
+        if uses_remaining == 0 {
+            return Err(ContractError::InvalidToken);
+        }
+        if expires_at <= env.ledger().timestamp() {
+            return Err(ContractError::InvalidToken);
+        }
+
+        // Verify the record_id is in-bounds.
+        let records_key = DataKey::MedicalRecords(patient.clone());
+        let records: Vec<MedicalRecord> = env
+            .storage()
+            .persistent()
+            .get(&records_key)
+            .unwrap_or(Vec::new(&env));
+        if record_id >= records.len() as u64 {
+            return Err(ContractError::InvalidToken);
+        }
+
+        // Increment per-patient nonce.
+        let nonce_key = DataKey::ShareNonce(patient.clone());
+        let nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&nonce_key)
+            .unwrap_or(0u64);
+        let next_nonce = nonce + 1;
+        env.storage().persistent().set(&nonce_key, &next_nonce);
+
+        // Build preimage: patient address bytes (32) + record_id (8) + nonce (8) + expires_at (8)
+        let patient_bytes = patient.clone().to_xdr(&env);
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&patient_bytes);
+        preimage.extend_from_array(&record_id.to_be_bytes());
+        preimage.extend_from_array(&next_nonce.to_be_bytes());
+        preimage.extend_from_array(&expires_at.to_be_bytes());
+
+        let token: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        let link = ShareLinkData {
+            patient: patient.clone(),
+            record_id,
+            uses_remaining,
+            expires_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ShareLink(token.clone()), &link);
+
+        env.events().publish(
+            (symbol_short!("sl_create"), patient),
+            (token.clone(), record_id, uses_remaining, expires_at),
+        );
+
+        Ok(token)
+    }
+
+    /// Redeem a share link token to read a single medical record.
+    ///
+    /// Any address may call this function. The token is validated for expiry
+    /// and remaining uses; uses_remaining is decremented on success and the
+    /// token is removed when it reaches zero.
+    pub fn use_share_link(
+        env: Env,
+        token: BytesN<32>,
+    ) -> Result<MedicalRecord, ContractError> {
+        let link_key = DataKey::ShareLink(token.clone());
+        let mut link: ShareLinkData = env
+            .storage()
+            .persistent()
+            .get(&link_key)
+            .ok_or(ContractError::InvalidToken)?;
+
+        // Check expiry.
+        if env.ledger().timestamp() >= link.expires_at {
+            env.storage().persistent().remove(&link_key);
+            return Err(ContractError::InvalidToken);
+        }
+
+        // Check uses.
+        if link.uses_remaining == 0 {
+            env.storage().persistent().remove(&link_key);
+            return Err(ContractError::InvalidToken);
+        }
+
+        // Fetch the record.
+        let records_key = DataKey::MedicalRecords(link.patient.clone());
+        let records: Vec<MedicalRecord> = env
+            .storage()
+            .persistent()
+            .get(&records_key)
+            .unwrap_or(Vec::new(&env));
+        let record = records
+            .get(link.record_id as u32)
+            .ok_or(ContractError::InvalidToken)?;
+
+        // Decrement uses.
+        link.uses_remaining -= 1;
+        if link.uses_remaining == 0 {
+            env.storage().persistent().remove(&link_key);
+        } else {
+            env.storage().persistent().set(&link_key, &link);
+        }
+
+        env.events().publish(
+            (symbol_short!("sl_use"), token),
+            (link.patient, link.record_id, link.uses_remaining),
+        );
+
+        Ok(record)
     }
 
     // =====================================================
