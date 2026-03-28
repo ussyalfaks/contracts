@@ -166,6 +166,7 @@ pub enum ContractError {
     InvalidDID = 4,
     InvalidScore = 5,
     ContractFrozen = 6,
+    NotFound = 7,
 }
 
 pub fn validate_cid(cid: &Bytes) -> Result<(), ContractError> {
@@ -848,7 +849,7 @@ impl MedicalRegistry {
         let record_data = RecordData {
             patient: patient.clone(),
             record_type: record_type.clone(),
-            description,
+            description: description.clone(),
             current_ipfs: record_hash.clone(),
             history: {
                 let mut h = Vec::new(&env);
@@ -858,27 +859,18 @@ impl MedicalRegistry {
             latest_version: 1u64,
         };
 
+        let record_id: u64 = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::RecordCounter)
+            .unwrap_or(0u64)
+            + 1;
+        env.storage().instance().set(&DataKey::RecordCounter, &record_id);
+
+        // Store record data (using cloned values)
         env.storage()
             .persistent()
             .set(&DataKey::MedicalRecord(record_id), &record_data);
-
-        // Append to the legacy Vec<MedicalRecord> (used by get_medical_records,
-        // create_share_link, use_share_link, and get_records_by_ids).
-        let legacy_key = DataKey::MedicalRecords(patient.clone());
-        let mut legacy: Vec<MedicalRecord> = env
-            .storage()
-            .persistent()
-            .get(&legacy_key)
-            .unwrap_or(Vec::new(&env));
-        legacy.push_back(MedicalRecord {
-            record_id,
-            doctor: doctor.clone(),
-            record_hash: record_hash.clone(),
-            description: record_data.description.clone(),
-            timestamp,
-            record_type: record_type.clone(),
-        });
-        env.storage().persistent().set(&legacy_key, &legacy);
 
         // Append to patient's record IDs
         let ids_key = DataKey::PatientRecordIds(patient.clone());
@@ -911,7 +903,15 @@ impl MedicalRegistry {
                 patient.clone(),
                 doctor.clone(),
             ),
-            (record_id, record_type, timestamp),
+            (record_id, record_type.clone(), timestamp),
+        );
+
+        // Extend TTL for all patient persistent entries after writing a record
+        Self::bump_patient_keys(&env, &patient);
+
+        env.events().publish(
+            (symbol_short!("rec_add"), record_id),
+            (patient, doctor),
         );
 
         Ok(record_id)
@@ -966,6 +966,7 @@ impl MedicalRegistry {
         env: Env,
         caller: Address,
         record_id: u64,
+        caller: Address,
         new_ipfs_hash: Bytes,
     ) -> Result<(), ContractError> {
         Self::require_not_frozen(&env);
@@ -975,7 +976,7 @@ impl MedicalRegistry {
             .storage()
             .persistent()
             .get(&record_key)
-            .ok_or(ContractError::NotAuthorized)?;
+            .ok_or(ContractError::NotFound)?;
 
         let patient = record_data.patient.clone();
         Self::require_patient_exists(&env, &patient);
@@ -1007,7 +1008,12 @@ impl MedicalRegistry {
             .extend_ttl(&record_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
 
         env.events()
-            .publish((symbol_short!("rec_updtd"), patient), caller);
+            .publish((
+                symbol_short!("rec_upd"),
+                (patient.clone(), caller.clone()),
+            ),
+            record_id,
+        );
 
         Ok(())
     }
@@ -1048,20 +1054,17 @@ impl MedicalRegistry {
 
         let mut filtered = Vec::new(&env);
         for id in record_ids.iter() {
-            if let Some(record_data) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, RecordData>(&DataKey::MedicalRecord(id))
-            {
+            let record_id: u64 = id.into();
+            if let Some(record_data) = env.storage().persistent().get::<DataKey, RecordData>(&DataKey::MedicalRecord(record_id)) {
                 if record_data.record_type == record_type {
                     // Map to MedicalRecord for compatibility
                     let mr = MedicalRecord {
-                        record_id: id,
+                        record_id,
                         doctor: record_data
                             .history
                             .get(0)
                             .map(|v| v.updated_by.clone())
-                            .unwrap_or(record_data.patient.clone()),
+                            .unwrap_or_else(|| Address::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4")),
                         record_hash: record_data.current_ipfs.clone(),
                         description: record_data.description.clone(),
                         timestamp: record_data
