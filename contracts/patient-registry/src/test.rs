@@ -1605,37 +1605,11 @@ fn setup_for_ttl(
 /// GET_RECORDS_BY_TYPE TESTS
 /// ------------------------------------------------
 
+/// GET_RECORDS_BY_TYPE TESTS
+/// ------------------------------------------------
+
 fn setup_for_filter(env: &Env) -> (MedicalRegistryClient<'_>, Address, Address) {
-    let contract_id = env.register(MedicalRegistry, ());
-    let client = MedicalRegistryClient::new(env, &contract_id);
-    let admin = Address::generate(env);
-    let treasury = Address::generate(env);
-    let fee_token = Address::generate(env);
-    let patient = Address::generate(env);
-    let doctor = Address::generate(env);
-    let v1 = make_version(env, 1);
-
-    env.mock_all_auths();
-
-    client.initialize(&admin, &treasury, &fee_token);
-    client.publish_consent_version(&v1);
-    client.register_patient(
-        &patient,
-        &String::from_str(env, "Batch Patient"),
-        &631152000,
-        &String::from_str(env, "ipfs://batch"),
-    );
-    client.acknowledge_consent(&patient, &patient, &v1);
-    client.grant_access(&patient, &patient, &doctor);
-
-    client.register_doctor(
-        &doctor,
-        &String::from_str(env, "Dr. Bob"),
-        &String::from_str(env, "Cardiology"),
-        &Bytes::from_array(env, &[1, 2, 3]),
-    );
-    client.grant_access(&patient, &patient, &doctor);
-
+    let (client, _admin, patient, doctor, _v1) = setup_for_ttl(env);
     (client, patient, doctor)
 }
 
@@ -1687,7 +1661,7 @@ fn test_get_records_by_type_returns_matching_records() {
 }
 
 #[test]
-fn test_get_records_ttl_persists_after_access() {
+fn test_get_records_by_type_ttl_refreshes_records() {
     let env = Env::default();
     env.ledger().set(make_ledger_info(100, 1_000_000));
 
@@ -1762,7 +1736,7 @@ fn test_get_records_extends_ttl() {
 }
 
 #[test]
-fn test_get_records_by_type_empty_after_different_type_added() {
+fn test_get_records_by_type_returns_empty_when_no_match_after_ttl() {
     let env = Env::default();
     let (client, patient, doctor) = setup_for_filter(&env);
 
@@ -1777,6 +1751,77 @@ fn test_get_records_by_type_empty_after_different_type_added() {
     // No PRESCRIPTION records exist — should return empty vec, not error
     let result = client.get_records_by_type(&patient, &patient, &Symbol::new(&env, "PRESCRIPTION"));
     assert_eq!(result.len(), 0);
+}
+
+#[test]
+fn test_get_latest_record_returns_most_recent() {
+    let env = Env::default();
+    env.ledger().set(make_ledger_info(100, 1_000_000));
+
+    let (client, _admin, patient, doctor, _v1) = setup_for_ttl(&env);
+
+    env.ledger().set_timestamp(1000);
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 51),
+        &String::from_str(&env, "First record"),
+        &Symbol::new(&env, "LAB"),
+    );
+
+    env.ledger().set_timestamp(2000);
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 52),
+        &String::from_str(&env, "Second record"),
+        &Symbol::new(&env, "LAB"),
+    );
+
+    let latest = client.get_latest_record(&patient, &patient).unwrap();
+    assert_eq!(latest.description, String::from_str(&env, "Second record"));
+    assert_eq!(latest.timestamp, 2000);
+}
+
+#[test]
+fn test_get_latest_record_returns_error_if_no_records() {
+    let env = Env::default();
+    let contract_id = env.register(MedicalRegistry, ());
+    let client = MedicalRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let fee_token = Address::generate(&env);
+    let patient = Address::generate(&env);
+    let doctor = Address::generate(&env);
+    let v1 = make_version(&env, 1);
+
+    env.mock_all_auths();
+    client.initialize(&admin, &treasury, &fee_token);
+    client.publish_consent_version(&v1);
+    client.register_patient(&patient, &String::from_str(&env, "NoRecords"), &631152000, &String::from_str(&env, "ipfs://none"));
+    client.acknowledge_consent(&patient, &patient, &v1);
+
+    let result = client.try_get_latest_record(&patient, &patient);
+    assert!(matches!(result, Err(Ok(ContractError::NoRecordsFound))));
+}
+
+#[test]
+fn test_get_latest_record_access_control() {
+    let env = Env::default();
+    env.ledger().set(make_ledger_info(100, 1_000_000));
+
+    let (client, _admin, patient, doctor, _v1) = setup_for_ttl(&env);
+    client.add_medical_record(
+        &patient,
+        &doctor,
+        &make_cid_v1(&env, 61),
+        &String::from_str(&env, "Record A"),
+        &Symbol::new(&env, "LAB"),
+    );
+
+    let attacker = Address::generate(&env);
+    let result = client.try_get_latest_record(&patient, &attacker);
+    assert!(result.is_err());
 }
 
 /// `extend_patient_ttl` called by the patient themselves must succeed and keep
