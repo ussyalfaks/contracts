@@ -39,7 +39,7 @@ members = [
   "contracts/provider-registry",
   "contracts/multisig-governance",
   "contracts/upgrade-governance",
-  "contracts/health-records",
+  "contracts/zk-eligibility-verifier",
 ]
 
 [workspace.dependencies]

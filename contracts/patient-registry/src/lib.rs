@@ -2,9 +2,14 @@
 #![allow(deprecated)]
 
 use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address,
+    Bytes, BytesN, Env, Map, String, Symbol, Vec,
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
     Address, Bytes, BytesN, Env, Map, String, Symbol, Vec,
 };
+
+pub mod validation;
+pub const NEW_RECORD_TOPIC: &str = "new_record";
 
 // =====================================================
 //                    TTL CONSTANTS
@@ -17,6 +22,16 @@ pub const LEDGER_BUMP_AMOUNT: u32 = 535_680;
 pub const LEDGER_THRESHOLD: u32 = 518_400;
 
 /// --------------------
+/// Patient Status
+/// --------------------
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PatientStatus {
+    Active,
+    Deregistered,
+}
+
+/// --------------------
 /// Patient Structures
 /// --------------------
 #[contracttype]
@@ -25,6 +40,7 @@ pub struct PatientData {
     pub name: String,
     pub dob: u64,
     pub metadata: String, // IPFS / encrypted medical refs
+    pub status: PatientStatus,
 }
 
 /// --------------------
@@ -72,17 +88,59 @@ pub enum DataKey {
     Treasury,
     FeeToken,
     TotalPatients,
+    /// Nonce counter per patient for share-link token generation.
+    ShareNonce(Address),
+    /// Share link data keyed by token hash.
+    ShareLink(BytesN<32>),
+    /// Marks a patient as deregistered (value: timestamp of deregistration).
+    Deregistered(Address),
+}
+
+/// --------------------
+/// Share Link
+/// --------------------
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShareLinkData {
+    pub patient: Address,
+    pub record_id: u64,
+    pub uses_remaining: u32,
+    pub expires_at: u64,
+    RecordCounter(Address),
     Frozen,
+    RecordCounter,
+    PatientRecordIds(Address),
+    MedicalRecord(u64),
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MedicalRecord {
+    pub record_id: u64,
     pub doctor: Address,
     pub record_hash: Bytes,
     pub description: String,
     pub timestamp: u64,
     pub record_type: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordVersion {
+    pub ipfs_hash: Bytes,
+    pub updated_by: Address,
+    pub updated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordData {
+    pub patient: Address,
+    pub record_type: Symbol,
+    pub description: String,
+    pub current_ipfs: Bytes,
+    pub history: Vec<RecordVersion>,
+    pub latest_version: u64,
 }
 
 #[contracttype]
@@ -99,38 +157,41 @@ pub struct RegulatoryHold {
 #[repr(u32)]
 pub enum ContractError {
     InvalidCID = 1,
+    InvalidToken = 2,
+    NotAuthorized = 3,
+    InvalidDID = 2,
+    InvalidScore = 3,
     ContractFrozen = 2,
 }
 
 pub fn validate_cid(cid: &Bytes) -> Result<(), ContractError> {
-    let len = cid.len();
-
+    let len = cid.len() as usize;
     if len == 0 || len > 512 {
         return Err(ContractError::InvalidCID);
     }
-
-    let first = cid.get(0).ok_or(ContractError::InvalidCID)?;
-
-    if first == b'b' {
-        return if len >= 36 {
-            Ok(())
-        } else {
-            Err(ContractError::InvalidCID)
-        };
+    let mut buf = [0u8; 512];
+    for i in 0..len {
+        buf[i] = cid.get(i as u32).ok_or(ContractError::InvalidCID)?;
     }
+    validation::validate_cid_bytes(&buf[..len]).map_err(|_| ContractError::InvalidCID)
+}
 
-    if len >= 2 {
-        let second = cid.get(1).ok_or(ContractError::InvalidCID)?;
-        if first == b'Q' && second == b'm' && len == 46 {
-            return Ok(());
-        }
-
-        if len == 34 && first == 0x12 && second == 0x20 {
-            return Ok(());
-        }
+/// Validates a decentralized identifier string (`did:method:…`) for metadata or
+/// cross-chain references. Fuzzed via `validation::validate_did_bytes`.
+pub fn validate_did(did: &String) -> Result<(), ContractError> {
+    let len = did.len() as usize;
+    if len > 256 {
+        return Err(ContractError::InvalidDID);
     }
+    let mut buf = [0u8; 256];
+    did.copy_into_slice(&mut buf[..len]);
+    validation::validate_did_bytes(&buf[..len]).map_err(|_| ContractError::InvalidDID)
+}
 
-    Err(ContractError::InvalidCID)
+/// Validates a bounded numeric score (default 0–100). Fuzzed via
+/// `validation::validate_score_i32`.
+pub fn validate_score(score: i32) -> Result<(), ContractError> {
+    validation::validate_score_i32(score).map_err(|_| ContractError::InvalidScore)
 }
 
 fn require_patient_or_guardian(env: &Env, patient: &Address, caller: &Address) {
@@ -186,6 +247,7 @@ impl MedicalRegistry {
         env.storage().instance().set(&DataKey::FeeToken, &fee_token);
         env.storage().instance().set(&DataKey::RecordFee, &0i128);
         env.storage().instance().set(&DataKey::TotalPatients, &0u64);
+        env.storage().instance().set(&DataKey::RecordCounter, &0u64);
     }
 
     // =====================================================
@@ -349,6 +411,7 @@ impl MedicalRegistry {
             name,
             dob,
             metadata,
+            status: PatientStatus::Active,
         };
         env.storage().persistent().set(&key, &patient);
         let total_patients: u64 = env
@@ -404,6 +467,46 @@ impl MedicalRegistry {
     pub fn is_patient_registered(env: Env, wallet: Address) -> bool {
         let key = DataKey::Patient(wallet);
         env.storage().persistent().has(&key)
+    }
+
+    /// Deregister the calling patient.
+    ///
+    /// - Sets `PatientData.status` to `Deregistered`.
+    /// - Clears all access grants so former grantees can no longer read records.
+    /// - Records are retained (not deleted) and remain readable by the admin.
+    /// - Emits a `pat_dreg` audit event.
+    pub fn deregister_patient(env: Env, patient: Address) {
+        patient.require_auth();
+
+        let key = DataKey::Patient(patient.clone());
+        let mut data: PatientData = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Patient not found");
+
+        if data.status == PatientStatus::Deregistered {
+            panic!("Patient already deregistered");
+        }
+
+        data.status = PatientStatus::Deregistered;
+        env.storage().persistent().set(&key, &data);
+
+        // Stamp deregistration time for audit trail.
+        env.storage().persistent().set(
+            &DataKey::Deregistered(patient.clone()),
+            &env.ledger().timestamp(),
+        );
+
+        // Revoke all access grants.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AuthorizedDoctors(patient.clone()));
+
+        env.events().publish(
+            (symbol_short!("pat_dreg"), patient),
+            env.ledger().timestamp(),
+        );
     }
 
     pub fn get_total_patients(env: Env) -> u64 {
@@ -676,8 +779,9 @@ impl MedicalRegistry {
         record_hash: Bytes,
         description: String,
         record_type: Symbol,
-    ) -> Result<(), ContractError> {
+    ) -> Result<u64, ContractError> {
         Self::require_not_frozen(&env);
+        Self::require_patient_exists(&env, &patient);
         doctor.require_auth();
         validate_cid(&record_hash)?;
 
@@ -718,50 +822,135 @@ impl MedicalRegistry {
             panic!("Doctor not authorized");
         }
 
-        let record = MedicalRecord {
-            doctor,
-            record_hash,
-            description,
-            timestamp: env.ledger().timestamp(),
-            record_type,
+        let timestamp = env.ledger().timestamp();
+
+        // Get next record ID
+        let mut record_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RecordCounter)
+            .unwrap_or(0u64);
+        record_id += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::RecordCounter, &record_id);
+
+        let initial_version = RecordVersion {
+            ipfs_hash: record_hash.clone(),
+            updated_by: doctor.clone(),
+            updated_at: timestamp,
         };
 
-        let records_key = DataKey::MedicalRecords(patient.clone());
-        let mut records: Vec<MedicalRecord> = env
+        let record_data = RecordData {
+            patient: patient.clone(),
+            record_type,
+            description,
+            current_ipfs: record_hash.clone(),
+            history: {
+                let mut h = Vec::new(&env);
+                h.push_back(initial_version);
+                h
+            },
+            latest_version: 1u64,
+        let counter_key = DataKey::RecordCounter(patient.clone());
+        let record_id: u64 = env
             .storage()
             .persistent()
-            .get(&records_key)
-            .unwrap_or(Vec::new(&env));
+            .get(&counter_key)
+            .unwrap_or(0u64)
+            + 1;
+        env.storage().persistent().set(&counter_key, &record_id);
 
-        records.push_back(record);
-        env.storage().persistent().set(&records_key, &records);
+        let timestamp = env.ledger().timestamp();
+
+        let record = MedicalRecord {
+            record_id,
+            doctor: doctor.clone(),
+            record_hash,
+            description,
+            timestamp,
+            record_type: record_type.clone(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MedicalRecord(record_id), &record_data);
+
+        // Append to patient's record IDs
+        let ids_key = DataKey::PatientRecordIds(patient.clone());
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&ids_key)
+            .unwrap_or(Vec::new(&env));
+        ids.push_back(record_id);
+        env.storage().persistent().set(&ids_key, &ids);
+
+        // TTL bump
+        Self::bump_patient_keys(&env, &patient);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MedicalRecord(record_id),
+            LEDGER_THRESHOLD,
+            LEDGER_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&ids_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
+        // Emit provider-to-patient record notification
+        env.events().publish(
+            (
+                Symbol::new(&env, NEW_RECORD_TOPIC),
+                patient.clone(),
+                doctor,
+            ),
+            (record_id, record_type, timestamp),
+        );
 
         // Extend TTL for all patient persistent entries after writing a record
         Self::bump_patient_keys(&env, &patient);
 
-        Ok(())
+        env.events().publish(
+            (symbol_short!("record_added"), record_id),
+            (patient, doctor),
+        );
+
+        Ok(record_id)
     }
 
-    pub fn get_medical_records(env: Env, patient: Address) -> Vec<MedicalRecord> {
+    pub fn get_medical_records(env: Env, patient: Address, caller: Address) -> Vec<MedicalRecord> {
+        // If the patient is deregistered, only the admin may read records.
+        let patient_key = DataKey::Patient(patient.clone());
+        if let Some(data) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PatientData>(&patient_key)
+        {
+            if data.status == PatientStatus::Deregistered {
+                let admin: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Admin)
+                    .expect("Not initialized");
+                if caller != admin {
+                    panic!("Records only accessible by admin after deregistration");
+                }
+            }
+        }
+
         let key = DataKey::MedicalRecords(patient.clone());
 
-        // Extend TTL on read to keep active records accessible
         if env.storage().persistent().has(&key) {
-            env.storage().persistent().extend_ttl(
-                &key,
-                LEDGER_THRESHOLD,
-                LEDGER_BUMP_AMOUNT,
-            );
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
         }
 
         // Also bump the patient record itself
         let patient_key = DataKey::Patient(patient.clone());
         if env.storage().persistent().has(&patient_key) {
-            env.storage().persistent().extend_ttl(
-                &patient_key,
-                LEDGER_THRESHOLD,
-                LEDGER_BUMP_AMOUNT,
-            );
+            env.storage()
+                .persistent()
+                .extend_ttl(&patient_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
         }
 
         env.storage()
@@ -773,6 +962,74 @@ impl MedicalRegistry {
     /// Returns all records for `patient` whose `record_type` matches the given symbol.
     /// Access control: caller must be the patient, their guardian, or an authorized doctor.
     /// Returns an empty vec (not an error) when no records match.
+    pub fn update_record(
+        env: Env,
+        record_id: u64,
+        new_ipfs_hash: Bytes,
+    ) -> Result<(), ContractError> {
+        Self::require_not_frozen(&env);
+
+        let record_key = DataKey::MedicalRecord(record_id);
+        let mut record_data: RecordData = env
+            .storage()
+            .persistent()
+            .get(&record_key)
+            .ok_or(Error::NotFound)?;
+
+        let patient = record_data.patient.clone();
+        Self::require_patient_exists(&env, &patient);
+        Self::require_not_on_hold(&env, &patient);
+
+        caller.require_auth();
+        require_record_access(&env, &patient, &caller);
+
+        validate_cid(&new_ipfs_hash)?;
+
+        let timestamp = env.ledger().timestamp();
+
+        // Append old current to history
+        let old_version = RecordVersion {
+            ipfs_hash: record_data.current_ipfs.clone(),
+            updated_by: caller.clone(),
+            updated_at: timestamp,
+        };
+        record_data.history.push_back(old_version);
+        record_data.current_ipfs = new_ipfs_hash;
+        record_data.latest_version += 1;
+
+        env.storage().persistent().set(&record_key, &record_data);
+
+        // TTL bump
+        Self::bump_patient_keys(&env, &patient);
+        env.storage()
+            .persistent()
+            .extend_ttl(&record_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
+
+        env.events()
+            .publish(symbol_short!("rec_updtd")(patient, caller));
+
+        Ok(())
+    }
+
+    pub fn get_record_history(
+        env: Env,
+        record_id: u64,
+    ) -> Result<Vec<RecordVersion>, ContractError> {
+        let record_key = DataKey::MedicalRecord(record_id);
+        let record_data: RecordData = env
+            .storage()
+            .persistent()
+            .get(&record_key)
+            .ok_or(ContractError::InvalidCID)?;
+
+        // TTL bump
+        env.storage()
+            .persistent()
+            .extend_ttl(&record_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
+
+        Ok(record_data.history)
+    }
+
     pub fn get_records_by_type(
         env: Env,
         patient: Address,
@@ -781,20 +1038,76 @@ impl MedicalRegistry {
     ) -> Vec<MedicalRecord> {
         require_record_access(&env, &patient, &caller);
 
-        let key = DataKey::MedicalRecords(patient);
+        let ids_key = DataKey::PatientRecordIds(patient);
+        let record_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&ids_key)
+            .unwrap_or(Vec::new(&env));
+
+        let mut filtered = Vec::new(&env);
+        for id in record_ids.iter() {
+            if let Some(record_data) = env.storage().persistent().get(&DataKey::MedicalRecord(id)) {
+                if record_data.record_type == record_type {
+                    // Map to MedicalRecord for compatibility
+                    let mr = MedicalRecord {
+                        doctor: record_data
+                            .history
+                            .get(0)
+                            .map(|v| v.updated_by.clone())
+                            .unwrap_or(Address::generate(&env)),
+                        record_hash: record_data.current_ipfs.clone(),
+                        description: record_data.description.clone(),
+                        timestamp: record_data
+                            .history
+                            .get(0)
+                            .map(|v| v.updated_at)
+                            .unwrap_or(0),
+                        record_type,
+                    };
+                    filtered.push_back(mr);
+                }
+            }
+        }
+        filtered
+    }
+
+    /// Returns records by positional IDs for a patient.
+    ///
+    /// `ids` can contain up to 10 entries. Missing IDs are either skipped
+    /// (`strict_not_found = false`) or cause a panic (`strict_not_found = true`).
+    pub fn get_records_by_ids(
+        env: Env,
+        patient: Address,
+        caller: Address,
+        ids: Vec<u32>,
+        strict_not_found: bool,
+    ) -> Vec<MedicalRecord> {
+        if ids.len() > 10 {
+            panic!("Too many record IDs; maximum is 10");
+        }
+        require_record_access(&env, &patient, &caller);
+
+        let key = DataKey::MedicalRecords(patient.clone());
         let records: Vec<MedicalRecord> = env
             .storage()
             .persistent()
             .get(&key)
             .unwrap_or(Vec::new(&env));
 
-        let mut filtered = Vec::new(&env);
-        for record in records.iter() {
-            if record.record_type == record_type {
-                filtered.push_back(record.clone());
+        let mut selected = Vec::new(&env);
+        for id in ids.iter() {
+            match records.get(id) {
+                Some(record) => selected.push_back(record),
+                None => {
+                    if strict_not_found {
+                        panic!("Record ID not found");
+                    }
+                }
             }
         }
-        filtered
+
+        selected
     }
 
     // =====================================================
@@ -872,6 +1185,139 @@ impl MedicalRegistry {
     }
 
     // =====================================================
+    //              PATIENT-CONTROLLED SHARE LINKS
+    // =====================================================
+
+    /// Create a time-limited, use-counted sharing token for a single record.
+    ///
+    /// Token = sha256(patient_bytes || record_id_be || nonce_be || expires_at_be)
+    ///
+    /// # Arguments
+    /// * `patient`    - The patient who owns the record (must auth).
+    /// * `record_id`  - 0-based index into the patient's medical records vec.
+    /// * `uses_remaining` - How many times the token may be used (must be > 0).
+    /// * `expires_at` - Unix timestamp after which the token is invalid.
+    pub fn create_share_link(
+        env: Env,
+        patient: Address,
+        record_id: u64,
+        uses_remaining: u32,
+        expires_at: u64,
+    ) -> Result<BytesN<32>, ContractError> {
+        patient.require_auth();
+
+        if uses_remaining == 0 {
+            return Err(ContractError::InvalidToken);
+        }
+        if expires_at <= env.ledger().timestamp() {
+            return Err(ContractError::InvalidToken);
+        }
+
+        // Verify the record_id is in-bounds.
+        let records_key = DataKey::MedicalRecords(patient.clone());
+        let records: Vec<MedicalRecord> = env
+            .storage()
+            .persistent()
+            .get(&records_key)
+            .unwrap_or(Vec::new(&env));
+        if record_id >= records.len() as u64 {
+            return Err(ContractError::InvalidToken);
+        }
+
+        // Increment per-patient nonce.
+        let nonce_key = DataKey::ShareNonce(patient.clone());
+        let nonce: u64 = env
+            .storage()
+            .persistent()
+            .get(&nonce_key)
+            .unwrap_or(0u64);
+        let next_nonce = nonce + 1;
+        env.storage().persistent().set(&nonce_key, &next_nonce);
+
+        // Build preimage: patient address bytes (32) + record_id (8) + nonce (8) + expires_at (8)
+        let patient_bytes = patient.clone().to_xdr(&env);
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&patient_bytes);
+        preimage.extend_from_array(&record_id.to_be_bytes());
+        preimage.extend_from_array(&next_nonce.to_be_bytes());
+        preimage.extend_from_array(&expires_at.to_be_bytes());
+
+        let token: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        let link = ShareLinkData {
+            patient: patient.clone(),
+            record_id,
+            uses_remaining,
+            expires_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ShareLink(token.clone()), &link);
+
+        env.events().publish(
+            (symbol_short!("sl_create"), patient),
+            (token.clone(), record_id, uses_remaining, expires_at),
+        );
+
+        Ok(token)
+    }
+
+    /// Redeem a share link token to read a single medical record.
+    ///
+    /// Any address may call this function. The token is validated for expiry
+    /// and remaining uses; uses_remaining is decremented on success and the
+    /// token is removed when it reaches zero.
+    pub fn use_share_link(
+        env: Env,
+        token: BytesN<32>,
+    ) -> Result<MedicalRecord, ContractError> {
+        let link_key = DataKey::ShareLink(token.clone());
+        let mut link: ShareLinkData = env
+            .storage()
+            .persistent()
+            .get(&link_key)
+            .ok_or(ContractError::InvalidToken)?;
+
+        // Check expiry.
+        if env.ledger().timestamp() >= link.expires_at {
+            env.storage().persistent().remove(&link_key);
+            return Err(ContractError::InvalidToken);
+        }
+
+        // Check uses.
+        if link.uses_remaining == 0 {
+            env.storage().persistent().remove(&link_key);
+            return Err(ContractError::InvalidToken);
+        }
+
+        // Fetch the record.
+        let records_key = DataKey::MedicalRecords(link.patient.clone());
+        let records: Vec<MedicalRecord> = env
+            .storage()
+            .persistent()
+            .get(&records_key)
+            .unwrap_or(Vec::new(&env));
+        let record = records
+            .get(link.record_id as u32)
+            .ok_or(ContractError::InvalidToken)?;
+
+        // Decrement uses.
+        link.uses_remaining -= 1;
+        if link.uses_remaining == 0 {
+            env.storage().persistent().remove(&link_key);
+        } else {
+            env.storage().persistent().set(&link_key, &link);
+        }
+
+        env.events().publish(
+            (symbol_short!("sl_use"), token),
+            (link.patient, link.record_id, link.uses_remaining),
+        );
+
+        Ok(record)
+    }
+
+    // =====================================================
     //                  PRIVATE HELPERS
     // =====================================================
 
@@ -927,19 +1373,18 @@ impl MedicalRegistry {
 
     /// Bump TTL for all critical persistent keys belonging to a patient.
     fn bump_patient_keys(env: &Env, patient: &Address) {
-        let keys: [DataKey; 4] = [
+        let keys: [DataKey; 5] = [
             DataKey::Patient(patient.clone()),
             DataKey::MedicalRecords(patient.clone()),
             DataKey::AuthorizedDoctors(patient.clone()),
+            DataKey::PatientRecordIds(patient.clone()),
             DataKey::ConsentAck(patient.clone()),
         ];
         for key in keys.iter() {
             if env.storage().persistent().has(key) {
-                env.storage().persistent().extend_ttl(
-                    key,
-                    LEDGER_THRESHOLD,
-                    LEDGER_BUMP_AMOUNT,
-                );
+                env.storage()
+                    .persistent()
+                    .extend_ttl(key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
             }
         }
     }
