@@ -109,6 +109,7 @@ pub enum DataKey {
     /// Soft-delete tombstone for a record (value: timestamp of deletion).
     DeletedRecord(u64),
     /// Merkle root for a patient's records.
+    /// Merkle root over the patient's ordered record IDs (see `merkle` module).
     MerkleRoot(Address),
 }
 
@@ -999,6 +1000,7 @@ impl MedicalRegistry {
             .unwrap_or(Vec::new(&env));
         ids.push_back(record_id);
         env.storage().persistent().set(&ids_key, &ids);
+        Self::update_merkle_root(&env, &patient, &ids);
 
         // ── Secondary index update ────────────────────────────────────────────
         // Atomically append (patient, record_id) to the global type index.
@@ -1140,6 +1142,38 @@ impl MedicalRegistry {
         }
 
         Ok(latest)
+    }
+
+    /// Merkle root over the patient's ordered record IDs (see `merkle` module).
+    /// If no root was persisted yet, recomputes from `PatientRecordIds` (or empty sentinel).
+    pub fn get_merkle_root(env: Env, patient: Address) -> BytesN<32> {
+        let key = DataKey::MerkleRoot(patient.clone());
+        if let Some(root) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BytesN<32>>(&key)
+        {
+            root
+        } else {
+            let ids_key = DataKey::PatientRecordIds(patient);
+            let ids: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&ids_key)
+                .unwrap_or(Vec::new(&env));
+            merkle::compute_merkle_root(&env, &ids)
+        }
+    }
+
+    /// Returns true iff `proof` is a valid Merkle membership proof for `record_id` under this patient's root.
+    pub fn verify_record_membership(
+        env: Env,
+        patient: Address,
+        record_id: u64,
+        proof: Vec<BytesN<32>>,
+    ) -> bool {
+        let root = Self::get_merkle_root(env.clone(), patient);
+        merkle::verify_membership(&env, record_id, &proof, &root)
     }
 
     /// Returns all records for `patient` whose `record_type` matches the given symbol.
@@ -1546,7 +1580,7 @@ impl MedicalRegistry {
         // ── Secondary index update ────────────────────────────────────────────
         // Remove this entry from the global type index atomically.
         let idx_key = DataKey::GlobalTypeIndex(record_data.record_type.clone());
-        let mut type_index: Vec<TypeIndexEntry> = env
+        let type_index: Vec<TypeIndexEntry> = env
             .storage()
             .persistent()
             .get(&idx_key)

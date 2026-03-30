@@ -1,5 +1,5 @@
 [package]
-name = "patient-registry"
+name = "health-records"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -12,5 +12,4 @@ doctest = false
 soroban-sdk = { workspace = true }
 
 [dev-dependencies]
-proptest = "1.4"
 soroban-sdk = { workspace = true, features = ["testutils"] }
