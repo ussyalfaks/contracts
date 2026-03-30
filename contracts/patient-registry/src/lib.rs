@@ -6,8 +6,8 @@ use soroban_sdk::{
     xdr::ToXdr, Address, Bytes, BytesN, Env, Map, String, Symbol, Vec,
 };
 
-pub mod validation;
 pub mod merkle;
+pub mod validation;
 pub const NEW_RECORD_TOPIC: &str = "new_record";
 
 // =====================================================
@@ -104,6 +104,8 @@ pub enum DataKey {
     PatientRecordIds(Address),
     /// Individual record data keyed by global record ID.
     MedicalRecord(u64),
+    /// Field-level access mask keyed by (patient, grantee, record_id).
+    FieldAccess(Address, Address, u64),
     /// Platform-wide secondary index: record_type → Vec<TypeIndexEntry>.
     GlobalTypeIndex(Symbol),
     /// Soft-delete tombstone for a record (value: timestamp of deletion).
@@ -143,6 +145,24 @@ pub struct MedicalRecord {
     pub description: String,
     pub timestamp: u64,
     pub record_type: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FieldPermission {
+    RecordType,
+    IpfsHash,
+    CreatedAt,
+    CreatedBy,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartialRecord {
+    pub record_type: Option<Symbol>,
+    pub ipfs_hash: Option<Bytes>,
+    pub created_at: Option<u64>,
+    pub created_by: Option<Address>,
 }
 
 #[contracttype]
@@ -252,6 +272,60 @@ fn require_record_access(env: &Env, patient: &Address, caller: &Address) {
     panic!("Caller not authorized to view records");
 }
 
+const FIELD_RECORD_TYPE: u32 = 1 << 0;
+const FIELD_IPFS_HASH: u32 = 1 << 1;
+const FIELD_CREATED_AT: u32 = 1 << 2;
+const FIELD_CREATED_BY: u32 = 1 << 3;
+const FIELD_ALL: u32 = FIELD_RECORD_TYPE | FIELD_IPFS_HASH | FIELD_CREATED_AT | FIELD_CREATED_BY;
+
+fn field_permission_mask(fields: Vec<FieldPermission>) -> u32 {
+    let mut mask = 0u32;
+    for field in fields.iter() {
+        mask |= match field {
+            FieldPermission::RecordType => FIELD_RECORD_TYPE,
+            FieldPermission::IpfsHash => FIELD_IPFS_HASH,
+            FieldPermission::CreatedAt => FIELD_CREATED_AT,
+            FieldPermission::CreatedBy => FIELD_CREATED_BY,
+        };
+    }
+    mask
+}
+
+fn empty_partial_record() -> PartialRecord {
+    PartialRecord {
+        record_type: None,
+        ipfs_hash: None,
+        created_at: None,
+        created_by: None,
+    }
+}
+
+fn build_partial_record(record_data: &RecordData, mask: u32) -> PartialRecord {
+    let created = record_data.history.get(0);
+    PartialRecord {
+        record_type: if (mask & FIELD_RECORD_TYPE) != 0 {
+            Some(record_data.record_type.clone())
+        } else {
+            None
+        },
+        ipfs_hash: if (mask & FIELD_IPFS_HASH) != 0 {
+            Some(record_data.current_ipfs.clone())
+        } else {
+            None
+        },
+        created_at: if (mask & FIELD_CREATED_AT) != 0 {
+            created.as_ref().map(|version| version.updated_at)
+        } else {
+            None
+        },
+        created_by: if (mask & FIELD_CREATED_BY) != 0 {
+            created.map(|version| version.updated_by)
+        } else {
+            None
+        },
+    }
+}
+
 #[contract]
 pub struct MedicalRegistry;
 
@@ -270,9 +344,15 @@ impl MedicalRegistry {
         env.storage().instance().set(&DataKey::FeeToken, &fee_token);
         env.storage().instance().set(&DataKey::RecordFee, &0i128);
         env.storage().instance().set(&DataKey::TotalPatients, &0u64);
-        env.storage().instance().set(&DataKey::TotalRecordsCreated, &0u64);
-        env.storage().instance().set(&DataKey::TotalProviders, &0u64);
-        env.storage().instance().set(&DataKey::TotalAccessGrants, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalRecordsCreated, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalProviders, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalAccessGrants, &0u64);
         env.storage().instance().set(&DataKey::RecordCounter, &0u64);
     }
 
@@ -820,6 +900,43 @@ impl MedicalRegistry {
         env.storage().persistent().set(&key, &map);
     }
 
+    pub fn grant_field_access(
+        env: Env,
+        patient: Address,
+        grantee: Address,
+        record_id: u64,
+        fields: Vec<FieldPermission>,
+    ) -> Result<(), ContractError> {
+        Self::require_not_frozen(&env);
+        patient.require_auth();
+        Self::require_not_on_hold(&env, &patient);
+
+        let record_data: RecordData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MedicalRecord(record_id))
+            .ok_or(ContractError::NotFound)?;
+        if record_data.patient != patient {
+            return Err(ContractError::NotAuthorized);
+        }
+
+        let access_key = DataKey::AuthorizedDoctors(patient.clone());
+        let access_map: Map<Address, bool> = env
+            .storage()
+            .persistent()
+            .get(&access_key)
+            .unwrap_or(Map::new(&env));
+        if !access_map.contains_key(grantee.clone()) {
+            return Err(ContractError::NotAuthorized);
+        }
+
+        let mask = field_permission_mask(fields);
+        env.storage()
+            .persistent()
+            .set(&DataKey::FieldAccess(patient, grantee, record_id), &mask);
+        Ok(())
+    }
+
     pub fn revoke_access(env: Env, patient: Address, caller: Address, doctor: Address) {
         Self::require_not_frozen(&env);
         require_patient_or_guardian(&env, &patient, &caller);
@@ -946,12 +1063,7 @@ impl MedicalRegistry {
         };
 
         let counter_key = DataKey::RecordCounter;
-        let record_id: u64 = env
-            .storage()
-            .persistent()
-            .get(&counter_key)
-            .unwrap_or(0u64)
-            + 1;
+        let record_id: u64 = env.storage().persistent().get(&counter_key).unwrap_or(0u64) + 1;
         env.storage().persistent().set(&counter_key, &record_id);
 
         let timestamp = env.ledger().timestamp();
@@ -1015,11 +1127,9 @@ impl MedicalRegistry {
             record_id,
         });
         env.storage().persistent().set(&idx_key, &type_index);
-        env.storage().persistent().extend_ttl(
-            &idx_key,
-            LEDGER_THRESHOLD,
-            LEDGER_BUMP_AMOUNT,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&idx_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
         // ─────────────────────────────────────────────────────────────────────
 
         // TTL bumps for per-patient and per-record keys.
@@ -1034,7 +1144,11 @@ impl MedicalRegistry {
             .extend_ttl(&ids_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
 
         env.events().publish(
-            (Symbol::new(&env, NEW_RECORD_TOPIC), patient.clone(), doctor.clone()),
+            (
+                Symbol::new(&env, NEW_RECORD_TOPIC),
+                patient.clone(),
+                doctor.clone(),
+            ),
             (record_id, record_type, timestamp),
         );
 
@@ -1072,9 +1186,11 @@ impl MedicalRegistry {
         // Also bump the patient record itself
         let patient_key = DataKey::Patient(patient.clone());
         if env.storage().persistent().has(&patient_key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&patient_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
+            env.storage().persistent().extend_ttl(
+                &patient_key,
+                LEDGER_THRESHOLD,
+                LEDGER_BUMP_AMOUNT,
+            );
         }
 
         env.storage()
@@ -1129,9 +1245,11 @@ impl MedicalRegistry {
                 .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
         }
         if env.storage().persistent().has(&patient_key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&patient_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
+            env.storage().persistent().extend_ttl(
+                &patient_key,
+                LEDGER_THRESHOLD,
+                LEDGER_BUMP_AMOUNT,
+            );
         }
 
         let mut latest = records.get(0).unwrap().clone();
@@ -1148,11 +1266,7 @@ impl MedicalRegistry {
     /// If no root was persisted yet, recomputes from `PatientRecordIds` (or empty sentinel).
     pub fn get_merkle_root(env: Env, patient: Address) -> BytesN<32> {
         let key = DataKey::MerkleRoot(patient.clone());
-        if let Some(root) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, BytesN<32>>(&key)
-        {
+        if let Some(root) = env.storage().persistent().get::<DataKey, BytesN<32>>(&key) {
             root
         } else {
             let ids_key = DataKey::PatientRecordIds(patient);
@@ -1223,11 +1337,8 @@ impl MedicalRegistry {
             .persistent()
             .extend_ttl(&record_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
 
-        env.events()
-            .publish((
-                symbol_short!("rec_upd"),
-                (patient.clone(), caller.clone()),
-            ),
+        env.events().publish(
+            (symbol_short!("rec_upd"), (patient.clone(), caller.clone())),
             record_id,
         );
 
@@ -1253,6 +1364,50 @@ impl MedicalRegistry {
         Ok(record_data.history)
     }
 
+    pub fn get_record_fields(
+        env: Env,
+        patient: Address,
+        caller: Address,
+        record_id: u64,
+    ) -> PartialRecord {
+        caller.require_auth();
+
+        let record_data: RecordData = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::MedicalRecord(record_id))
+        {
+            Some(record) => record,
+            None => return empty_partial_record(),
+        };
+        if record_data.patient != patient {
+            return empty_partial_record();
+        }
+
+        let guardian_key = DataKey::Guardian(patient.clone());
+        let guardian_opt: Option<Address> = env.storage().persistent().get(&guardian_key);
+        let mask = if caller == patient || guardian_opt.as_ref() == Some(&caller) {
+            FIELD_ALL
+        } else {
+            let access_key = DataKey::AuthorizedDoctors(patient.clone());
+            let access_map: Map<Address, bool> = env
+                .storage()
+                .persistent()
+                .get(&access_key)
+                .unwrap_or(Map::new(&env));
+            if !access_map.contains_key(caller.clone()) {
+                return empty_partial_record();
+            }
+
+            env.storage()
+                .persistent()
+                .get(&DataKey::FieldAccess(patient, caller, record_id))
+                .unwrap_or(0u32)
+        };
+
+        build_partial_record(&record_data, mask)
+    }
+
     pub fn get_records_by_type(
         env: Env,
         patient: Address,
@@ -1271,7 +1426,11 @@ impl MedicalRegistry {
         let mut filtered = Vec::new(&env);
         for id in record_ids.iter() {
             let record_id: u64 = id.into();
-            if let Some(record_data) = env.storage().persistent().get::<DataKey, RecordData>(&DataKey::MedicalRecord(record_id)) {
+            if let Some(record_data) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, RecordData>(&DataKey::MedicalRecord(record_id))
+            {
                 if record_data.record_type == record_type {
                     // Map to MedicalRecord for compatibility
                     let mr = MedicalRecord {
@@ -1280,7 +1439,12 @@ impl MedicalRegistry {
                             .history
                             .get(0)
                             .map(|v| v.updated_by.clone())
-                            .unwrap_or_else(|| Address::from_str(&env, "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4")),
+                            .unwrap_or_else(|| {
+                                Address::from_str(
+                                    &env,
+                                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+                                )
+                            }),
                         record_hash: record_data.current_ipfs.clone(),
                         description: record_data.description.clone(),
                         timestamp: record_data
@@ -1451,11 +1615,7 @@ impl MedicalRegistry {
 
         // Increment per-patient nonce.
         let nonce_key = DataKey::ShareNonce(patient.clone());
-        let nonce: u64 = env
-            .storage()
-            .persistent()
-            .get(&nonce_key)
-            .unwrap_or(0u64);
+        let nonce: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0u64);
         let next_nonce = nonce + 1;
         env.storage().persistent().set(&nonce_key, &next_nonce);
 
@@ -1492,10 +1652,7 @@ impl MedicalRegistry {
     /// Any address may call this function. The token is validated for expiry
     /// and remaining uses; uses_remaining is decremented on success and the
     /// token is removed when it reaches zero.
-    pub fn use_share_link(
-        env: Env,
-        token: BytesN<32>,
-    ) -> Result<MedicalRecord, ContractError> {
+    pub fn use_share_link(env: Env, token: BytesN<32>) -> Result<MedicalRecord, ContractError> {
         let link_key = DataKey::ShareLink(token.clone());
         let mut link: ShareLinkData = env
             .storage()
@@ -1552,7 +1709,11 @@ impl MedicalRegistry {
     /// Callable by the owning patient, their guardian, or an authorized doctor.
     /// After deletion the record data is retained for audit purposes but will no
     /// longer appear in index queries.
-    pub fn soft_delete_record(env: Env, record_id: u64, caller: Address) -> Result<(), ContractError> {
+    pub fn soft_delete_record(
+        env: Env,
+        record_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
         Self::require_not_frozen(&env);
 
         let record_key = DataKey::MedicalRecord(record_id);
@@ -1567,7 +1728,11 @@ impl MedicalRegistry {
         require_record_access(&env, &patient, &caller);
 
         // Guard: already deleted?
-        if env.storage().persistent().has(&DataKey::DeletedRecord(record_id)) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::DeletedRecord(record_id))
+        {
             panic!("Record already deleted");
         }
 
@@ -1593,11 +1758,9 @@ impl MedicalRegistry {
             }
         }
         env.storage().persistent().set(&idx_key, &updated);
-        env.storage().persistent().extend_ttl(
-            &idx_key,
-            LEDGER_THRESHOLD,
-            LEDGER_BUMP_AMOUNT,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&idx_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
         // ─────────────────────────────────────────────────────────────────────
 
         env.events().publish(
@@ -1625,11 +1788,9 @@ impl MedicalRegistry {
             .unwrap_or(Vec::new(&env));
 
         if env.storage().persistent().has(&idx_key) {
-            env.storage().persistent().extend_ttl(
-                &idx_key,
-                LEDGER_THRESHOLD,
-                LEDGER_BUMP_AMOUNT,
-            );
+            env.storage()
+                .persistent()
+                .extend_ttl(&idx_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
         }
 
         Ok(index)
@@ -1639,10 +1800,7 @@ impl MedicalRegistry {
     /// across all patients.
     ///
     /// **Admin-only.** Non-admins receive `NotAuthorized`.
-    pub fn get_global_type_count(
-        env: Env,
-        record_type: Symbol,
-    ) -> Result<u64, ContractError> {
+    pub fn get_global_type_count(env: Env, record_type: Symbol) -> Result<u64, ContractError> {
         Self::require_admin(&env);
 
         let idx_key = DataKey::GlobalTypeIndex(record_type);
@@ -1715,11 +1873,9 @@ impl MedicalRegistry {
         let root = merkle::compute_merkle_root(env, ids);
         let root_key = DataKey::MerkleRoot(patient.clone());
         env.storage().persistent().set(&root_key, &root);
-        env.storage().persistent().extend_ttl(
-            &root_key,
-            LEDGER_THRESHOLD,
-            LEDGER_BUMP_AMOUNT,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&root_key, LEDGER_THRESHOLD, LEDGER_BUMP_AMOUNT);
     }
 
     /// Bump TTL for all critical persistent keys belonging to a patient.
